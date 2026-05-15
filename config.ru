@@ -1,3 +1,4 @@
+require_relative 'lib/local_ssl_trust'
 require 'inferno'
 
 use Rack::Static,

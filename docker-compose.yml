@@ -5,6 +5,9 @@ services:
       context: ./
     volumes:
       - ./data:/opt/inferno/data
+      - ./config:/opt/inferno/config
+      - ./config.ru:/opt/inferno/config.ru
+      - ./lib/local_ssl_trust.rb:/opt/inferno/lib/local_ssl_trust.rb
     depends_on:
       # - validator_service
       - hl7_validator_service
@@ -13,6 +16,9 @@ services:
       context: ./
     volumes:
       - ./data:/opt/inferno/data
+      - ./config:/opt/inferno/config
+      - ./worker.rb:/opt/inferno/worker.rb
+      - ./lib/local_ssl_trust.rb:/opt/inferno/lib/local_ssl_trust.rb
     command: bundle exec sidekiq -r ./worker.rb
     depends_on:
       - redis
