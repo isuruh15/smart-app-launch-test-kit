@@ -4,7 +4,7 @@ require 'openssl'
 # Patches OpenSSL::X509::Store#set_default_paths so every SSL client
 # (Net::HTTP, Faraday, tls_test_kit, etc.) automatically trusts these certs.
 # Must be loaded before any SSL connections are made (i.e. before 'inferno').
-_trusted_certs = %w[config/local-ca.crt]
+_trusted_certs = %w[config/wso2is.crt config/wso2apim.crt]
   .map { |p| File.expand_path(p, File.join(__dir__, '..')) }
   .select { |p| File.exist?(p) }
 

@@ -2,11 +2,10 @@
 # ---------------------------------------------------------------------------
 # export-wso2-certs.sh
 #
-# Exports TLS certificates from WSO2 IS and WSO2 APIM keystores, re-signs
-# them with a local CA that includes all required SANs (localhost,
-# host.docker.internal, 127.0.0.1), imports the new certs back into the
-# WSO2 keystores, and places the local CA cert into config/ so Inferno
-# trusts it during test runs.
+# Re-generates self-signed TLS certificates for WSO2 IS and WSO2 APIM with
+# extended SANs (localhost, host.docker.internal, 127.0.0.1), imports them
+# back into the WSO2 keystores, cross-imports into each product's client
+# truststore, and copies the certs into config/ so Inferno trusts them.
 #
 # Usage:
 #   ./export-wso2-certs.sh <IS_HOME> <APIM_HOME>
@@ -60,10 +59,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="$SCRIPT_DIR/config"
 [[ -d "$CONFIG_DIR" ]] || die "config/ directory not found at: $CONFIG_DIR"
 
-LOCAL_CA_KEY="$CONFIG_DIR/local-ca.key"
-LOCAL_CA_CERT="$CONFIG_DIR/local-ca.crt"
-
-# SANs that every re-signed cert will include
+# SANs included in every re-generated cert
 SANS="DNS:localhost,DNS:host.docker.internal,IP:127.0.0.1"
 
 # ---- TOML parser -----------------------------------------------------------
@@ -104,10 +100,10 @@ detect_keystore() {
         }
     done
 
-    [[ -z "$file_name"   ]] && file_name="wso2carbon.jks"
-    [[ -z "$password"    ]] && password="wso2carbon"
-    [[ -z "$ks_alias"    ]] && ks_alias="wso2carbon"
-    [[ -z "$store_type"  ]] && {
+    [[ -z "$file_name"  ]] && file_name="wso2carbon.jks"
+    [[ -z "$password"   ]] && password="wso2carbon"
+    [[ -z "$ks_alias"   ]] && ks_alias="wso2carbon"
+    [[ -z "$store_type" ]] && {
         case "${file_name##*.}" in
             p12|pfx) store_type="PKCS12" ;;
             *)       store_type="JKS"    ;;
@@ -117,32 +113,9 @@ detect_keystore() {
     echo "${file_name}|${password}|${ks_alias}|${store_type}"
 }
 
-# ---- local CA --------------------------------------------------------------
-# Creates a local CA once; reuses it on subsequent runs so Inferno doesn't
-# need to re-trust a new CA cert every time the script runs.
-
-ensure_local_ca() {
-    if [[ -f "$LOCAL_CA_KEY" && -f "$LOCAL_CA_CERT" ]]; then
-        info "Reusing existing local CA: $LOCAL_CA_CERT"
-        return
-    fi
-
-    info "Generating local CA ..."
-    openssl genrsa -out "$LOCAL_CA_KEY" 4096 2>/dev/null
-    openssl req -new -x509 \
-        -key    "$LOCAL_CA_KEY" \
-        -out    "$LOCAL_CA_CERT" \
-        -days   3650 \
-        -subj   "/O=Inferno Local Dev CA/CN=Inferno Local Dev CA" \
-        -extensions v3_ca \
-        -addext "basicConstraints=critical,CA:TRUE" \
-        2>/dev/null
-    info "  CA cert: $LOCAL_CA_CERT (valid 10 years)"
-}
-
-# ---- re-sign a WSO2 cert with extended SANs --------------------------------
-# Exports the original cert+key from the WSO2 keystore, generates a new cert
-# signed by the local CA with the required SANs, and imports it back.
+# ---- re-generate a self-signed cert with extended SANs ---------------------
+# Extracts the original private key, generates a new self-signed cert with
+# the same subject but extended SANs, imports it back into the keystore.
 #
 # Args: label ks_path ks_pass ks_alias ks_type out_cert
 resign_and_import() {
@@ -159,7 +132,6 @@ resign_and_import() {
 
     local orig_p12="$tmpdir/orig.p12"
     local server_key="$tmpdir/server.key"
-    local server_csr="$tmpdir/server.csr"
     local new_cert="$tmpdir/new.crt"
     local new_p12="$tmpdir/new.p12"
     local ext_file="$tmpdir/ext.cnf"
@@ -168,12 +140,12 @@ resign_and_import() {
 
     local ks_backup="${ks_path}.bak"
 
-    # Back up original keystore so we can do all openssl work offline,
-    # then replace it atomically with one file copy — only 0 keytool calls
-    # on the live keystore until the final replace, avoiding JKS lockout.
+    # Back up the original keystore — all keytool operations run on the
+    # backup copy so the live file is untouched until the final replace,
+    # avoiding JKS brute-force lockout from failed attempts.
     cp "$ks_path" "$ks_backup"
 
-    # 1. Export original keystore → PKCS12 from the backup (1 keytool call)
+    # 1. Export backup → PKCS12 (single keytool call on the backup)
     keytool -importkeystore \
         -srckeystore   "$ks_backup" \
         -srcstoretype  "$ks_type" \
@@ -187,15 +159,14 @@ resign_and_import() {
         -noprompt 2>/dev/null \
         || { cp "$ks_backup" "$ks_path"; die "keytool export failed for $label"; }
 
-    # 2. Extract private key
+    # 2. Extract private key from PKCS12
     openssl pkcs12 \
-        -in     "$orig_p12" \
-        -nocerts -nodes \
+        -in "$orig_p12" -nocerts -nodes \
         -passin pass:tmppass \
-        -out    "$server_key" 2>/dev/null \
-        || die "openssl key extraction failed for $label"
+        -out "$server_key" 2>/dev/null \
+        || die "Private key extraction failed for $label"
 
-    # 3. Read original cert subject from the exported PKCS12
+    # 3. Read original subject from the exported PKCS12
     local orig_subj
     orig_subj=$(openssl pkcs12 -in "$orig_p12" -nokeys -passin pass:tmppass 2>/dev/null \
         | openssl x509 -noout -subject 2>/dev/null \
@@ -207,32 +178,31 @@ parts = [p.strip() for p in re.split(r',\s*(?=[A-Z]+=)', dn)]
 print('/' + '/'.join(parts))
 ")
 
-    # 4. Generate CSR
-    openssl req -new \
-        -key  "$server_key" \
-        -out  "$server_csr" \
-        -subj "$orig_subj" 2>/dev/null \
-        || die "openssl CSR generation failed for $label"
-
-    # 5. Build SAN extension file
+    # 4. Build OpenSSL config for self-signed cert with SANs
     cat > "$ext_file" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions    = v3_req
+prompt             = no
+
+[dn]
+$(echo "$orig_subj" | tr '/' '\n' | grep '=' | sed 's/^//')
+
 [v3_req]
-subjectAltName = ${SANS}
-keyUsage = digitalSignature, keyEncipherment
+subjectAltName  = ${SANS}
+keyUsage        = digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
+basicConstraints = CA:FALSE
 EOF
 
-    # 6. Sign with local CA
-    openssl x509 -req \
-        -in         "$server_csr" \
-        -CA         "$LOCAL_CA_CERT" \
-        -CAkey      "$LOCAL_CA_KEY" \
-        -CAcreateserial \
-        -out        "$new_cert" \
-        -days       1825 \
-        -extfile    "$ext_file" \
-        -extensions v3_req 2>/dev/null \
-        || die "openssl signing failed for $label"
+    # 5. Generate new self-signed cert using the original private key
+    openssl req -new -x509 \
+        -key     "$server_key" \
+        -out     "$new_cert" \
+        -days    1825 \
+        -config  "$ext_file" \
+        2>/dev/null \
+        || die "Self-signed cert generation failed for $label"
 
     local new_subj new_expiry new_sans
     new_subj=$(openssl x509  -noout -subject -in "$new_cert" 2>/dev/null | sed 's/subject=//')
@@ -240,23 +210,20 @@ EOF
     new_sans=$(openssl x509  -noout -text   -in "$new_cert" 2>/dev/null \
         | grep -A1 "Subject Alternative Name" | tail -1 | xargs)
 
-    info "  New cert subject : $new_subj"
-    info "  New cert SANs    : $new_sans"
-    info "  New cert expires : $new_expiry"
+    info "  Subject : $new_subj"
+    info "  SANs    : $new_sans"
+    info "  Expires : $new_expiry"
 
-    # 7. Pack new cert + key into a fresh PKCS12
+    # 6. Pack new self-signed cert + original key into PKCS12
     openssl pkcs12 -export \
-        -in      "$new_cert" \
-        -inkey   "$server_key" \
-        -out     "$new_p12" \
-        -name    "$ks_alias" \
+        -in     "$new_cert" \
+        -inkey  "$server_key" \
+        -out    "$new_p12" \
+        -name   "$ks_alias" \
         -passout pass:tmppass 2>/dev/null \
-        || die "openssl pkcs12 pack failed for $label"
+        || die "PKCS12 packing failed for $label"
 
-    # 8. Build a brand-new keystore from the backup, replacing only the target alias.
-    #    Strategy: copy backup → tmp keystore, delete alias, import new cert+key.
-    #    All keytool calls operate on the tmp file — the live keystore is untouched
-    #    until the atomic cp at the end.
+    # 7. Build replacement keystore from backup, swap only the target alias
     local tmp_ks="$tmpdir/new_keystore.${ks_path##*.}"
     cp "$ks_backup" "$tmp_ks"
 
@@ -281,21 +248,51 @@ EOF
         -noprompt 2>/dev/null \
         || { cp "$ks_backup" "$ks_path"; die "keytool import failed for $label"; }
 
-    # 9. Atomically replace the live keystore
+    # 8. Atomically replace the live keystore
     cp "$tmp_ks" "$ks_path"
 
     cp "$new_cert" "$out_cert"
-    info "  Imported back into: $ks_path"
-    info "  Backup retained at: $ks_backup"
-    info "  Cert saved to     : $out_cert"
+    info "  Imported back into : $ks_path"
+    info "  Backup retained at : $ks_backup"
+    info "  Cert saved to      : $out_cert"
+}
+
+# ---- import a cert into a truststore ---------------------------------------
+# Removes any existing entry for the alias then re-imports.
+#
+# Args: label ts_path ts_pass ts_type alias cert_file
+import_to_truststore() {
+    local label="$1"
+    local ts_path="$2"
+    local ts_pass="$3"
+    local ts_type="$4"
+    local ts_alias="$5"
+    local cert_file="$6"
+
+    [[ -f "$ts_path"   ]] || { warn "Truststore not found, skipping: $ts_path"; return; }
+    [[ -f "$cert_file" ]] || { warn "Cert not found, skipping: $cert_file"; return; }
+
+    keytool -delete \
+        -keystore  "$ts_path" \
+        -storetype "$ts_type" \
+        -storepass "$ts_pass" \
+        -alias     "$ts_alias" \
+        -noprompt 2>/dev/null || true
+
+    keytool -import \
+        -keystore  "$ts_path" \
+        -storetype "$ts_type" \
+        -storepass "$ts_pass" \
+        -alias     "$ts_alias" \
+        -file      "$cert_file" \
+        -noprompt 2>/dev/null \
+        && info "  Imported into $label truststore (alias: $ts_alias)" \
+        || warn "  Failed to import into $label truststore: $ts_path"
 }
 
 # ---- main ------------------------------------------------------------------
 
-# Step 1: ensure local CA exists
-ensure_local_ca
-
-# Step 2: detect keystores
+# Step 1: detect keystores
 info "Detecting IS keystore configuration ..."
 IS_KS_INFO=$(detect_keystore "$IS_HOME")
 IS_KS_FILE=$(echo  "$IS_KS_INFO" | cut -d'|' -f1)
@@ -316,71 +313,52 @@ APIM_KS_PATH="$APIM_HOME/repository/resources/security/$APIM_KS_FILE"
 [[ -f "$APIM_KS_PATH" ]] || die "APIM keystore not found: $APIM_KS_PATH"
 info "  $APIM_KS_PATH (alias: $APIM_KS_ALIAS, type: $APIM_KS_TYPE)"
 
-# Step 3: re-sign certs and import back into WSO2 keystores
-resign_and_import "WSO2 IS"   "$IS_KS_PATH"   "$IS_KS_PASS"   "$IS_KS_ALIAS"   "$IS_KS_TYPE"   "$CONFIG_DIR/wso2is.crt"
-info "Waiting for JKS lockout to reset before processing APIM ..."
+IS_CERT="$CONFIG_DIR/wso2is.crt"
+APIM_CERT="$CONFIG_DIR/wso2apim.crt"
+
+IS_TS_PATH="$IS_HOME/repository/resources/security/client-truststore.p12"
+APIM_TS_PATH="$APIM_HOME/repository/resources/security/client-truststore.jks"
+
+# Step 2: re-generate self-signed certs with extended SANs and import back
+resign_and_import "WSO2 IS"   "$IS_KS_PATH"   "$IS_KS_PASS"   "$IS_KS_ALIAS"   "$IS_KS_TYPE"   "$IS_CERT"
+info "Waiting before processing APIM keystore ..."
 sleep 30
-resign_and_import "WSO2 APIM" "$APIM_KS_PATH" "$APIM_KS_PASS" "$APIM_KS_ALIAS" "$APIM_KS_TYPE" "$CONFIG_DIR/wso2apim.crt"
+resign_and_import "WSO2 APIM" "$APIM_KS_PATH" "$APIM_KS_PASS" "$APIM_KS_ALIAS" "$APIM_KS_TYPE" "$APIM_CERT"
 
-# Step 4: import local CA into WSO2 client truststores so outbound SSL calls succeed
-import_ca_to_truststore() {
-    local label="$1"
-    local ts_path="$2"
-    local ts_pass="$3"
-    local ts_type="$4"
+# Step 3: cross-import certs into each product's client truststore
+# IS trusts APIM cert; APIM trusts IS cert; each trusts its own cert for
+# internal calls (e.g. IS calling its own 9443 endpoint).
+info "Updating client truststores ..."
+import_to_truststore "WSO2 IS (own cert)"   "$IS_TS_PATH"   "wso2carbon" "PKCS12" "wso2is"   "$IS_CERT"
+import_to_truststore "WSO2 IS (APIM cert)"  "$IS_TS_PATH"   "wso2carbon" "PKCS12" "wso2apim" "$APIM_CERT"
+import_to_truststore "WSO2 APIM (own cert)" "$APIM_TS_PATH" "wso2carbon" "JKS"    "wso2apim" "$APIM_CERT"
+import_to_truststore "WSO2 APIM (IS cert)"  "$APIM_TS_PATH" "wso2carbon" "JKS"    "wso2is"   "$IS_CERT"
 
-    [[ -f "$ts_path" ]] || { warn "Truststore not found, skipping: $ts_path"; return; }
-
-    # Remove stale entry if present, then re-import
-    keytool -delete \
-        -keystore  "$ts_path" \
-        -storetype "$ts_type" \
-        -storepass "$ts_pass" \
-        -alias     inferno-local-ca \
-        -noprompt 2>/dev/null || true
-
-    keytool -import \
-        -keystore  "$ts_path" \
-        -storetype "$ts_type" \
-        -storepass "$ts_pass" \
-        -alias     inferno-local-ca \
-        -file      "$LOCAL_CA_CERT" \
-        -noprompt 2>/dev/null \
-        && info "  Local CA imported into $label truststore: $ts_path" \
-        || warn "  Failed to import local CA into $label truststore: $ts_path"
-}
-
-info "Importing local CA into WSO2 client truststores ..."
-import_ca_to_truststore "WSO2 IS"   \
-    "$IS_HOME/repository/resources/security/client-truststore.p12"   "wso2carbon" "PKCS12"
-import_ca_to_truststore "WSO2 APIM" \
-    "$APIM_HOME/repository/resources/security/client-truststore.jks" "wso2carbon" "JKS"
-
-# Step 6: update local_ssl_trust.rb to trust the local CA (not individual certs)
+# Step 4: update local_ssl_trust.rb to trust individual certs
 SSL_TRUST="$SCRIPT_DIR/lib/local_ssl_trust.rb"
 [[ -f "$SSL_TRUST" ]] || die "lib/local_ssl_trust.rb not found at: $SSL_TRUST"
 
-sed -i.bak "s|'config/wso2is.crt', 'config/wso2apim.crt'|'config/local-ca.crt'|" "$SSL_TRUST" \
+sed -i.bak "s|'config/local-ca.crt'|'config/wso2is.crt', 'config/wso2apim.crt'|" "$SSL_TRUST" \
     && rm -f "$SSL_TRUST.bak"
 
-# Verify the replacement worked; if the format changed, warn
-if ! grep -q "local-ca.crt" "$SSL_TRUST"; then
+if ! grep -q "wso2is.crt" "$SSL_TRUST"; then
     warn "Could not auto-update lib/local_ssl_trust.rb."
-    warn "Manually set trusted_certs to include 'config/local-ca.crt'."
+    warn "Manually set trusted_certs to include 'config/wso2is.crt' and 'config/wso2apim.crt'."
 fi
+
+# Step 5: clean up old CA files if present (no longer needed)
+rm -f "$CONFIG_DIR/local-ca.crt" "$CONFIG_DIR/local-ca.key" "$CONFIG_DIR/local-ca.srl"
 
 # ---- summary ---------------------------------------------------------------
 
 echo ""
 info "Done."
 echo ""
-echo "  Local CA cert   → $LOCAL_CA_CERT"
-echo "  WSO2 IS cert    → $CONFIG_DIR/wso2is.crt  (re-signed, imported into IS keystore)"
-echo "  WSO2 APIM cert  → $CONFIG_DIR/wso2apim.crt (re-signed, imported into APIM keystore)"
+echo "  WSO2 IS   cert → $IS_CERT"
+echo "  WSO2 APIM cert → $APIM_CERT"
 echo ""
-info "SANs in new certs: $SANS"
+info "SANs in new certs : $SANS"
+info "Inferno trusts    : config/wso2is.crt, config/wso2apim.crt (individual self-signed certs)"
 echo ""
-info "Inferno will trust all certs signed by the local CA (config/local-ca.crt)."
-echo ""
-warn "WSO2 servers must be restarted to present the new certificates."
+warn "Restart WSO2 IS and APIM to present the new certificates."
 info "Then restart Inferno: docker compose restart inferno worker"
